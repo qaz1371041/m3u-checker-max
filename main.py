@@ -847,11 +847,11 @@ def run_speed_test(to_test):
             if is_valid:
                 if name not in valid_results: valid_results[name] = []
                 valid_results[name].append((url, elapsed))
-                msg = f"{progress} 🟢 {name:<12} | {elapsed:>4}s | {url}"
+                msg = f"{progress} 🟢 {name:<12} | {elapsed:>4}s | {reason:<15} | {url}"
                 live_print(msg)
                 logs_success.append(msg)
             else:
-                msg = f"{progress} 🔴 {name:<12} | {reason:<10} | {url}"
+                msg = f"{progress} 🔴 {name:<12} | {reason:<15} | {url}"
                 logs_fail.append(msg)
 
     live_print(f"\n🏁 测速结束: 成功 {len(logs_success)} / 失败 {len(logs_fail)}\n")
