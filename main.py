@@ -44,14 +44,11 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "50"))
 CHECK_CONNECT_TIMEOUT = int(os.environ.get("CHECK_CONNECT_TIMEOUT", "5"))
 CHECK_READ_TIMEOUT = int(os.environ.get("CHECK_READ_TIMEOUT", "8"))
 CHECK_TOTAL_TIMEOUT = int(os.environ.get("CHECK_TOTAL_TIMEOUT", "15"))
-CHECK_DOWNLOAD_TARGET = 128 * 1024  # 128KB
+CHECK_DOWNLOAD_TARGET = 1024 * 1024  # 1MB（从128KB增大，过滤半死不活的流）
+CHECK_MIN_BANDWIDTH_MBPS = float(os.environ.get("CHECK_MIN_BANDWIDTH_MBPS", "2.0"))  # 最小带宽阈值
 
 # EPG 并发下载数
 EPG_MAX_WORKERS = int(os.environ.get("EPG_MAX_WORKERS", "4"))
-
-# 来源免测配置：iptv-api 已做过测速+分辨率过滤，跳过二次测速
-IPTV_API_SOURCE_URL = "https://raw.githubusercontent.com/JE668/iptv-api/refs/heads/master/output/result.m3u"
-IPTV_API_SKIP_TEST_TTL_HOURS = int(os.environ.get("IPTV_API_SKIP_TEST_TTL_HOURS", "24"))
 
 # 重试配置
 RETRY_MAX_ATTEMPTS = int(os.environ.get("RETRY_MAX_ATTEMPTS", "2"))
@@ -407,29 +404,10 @@ def fetch_and_parse_channels(aliases_exact, aliases_regex, known_main_names):
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
-    # 检查 iptv-api 数据新鲜度（TTL 保护）
-    iptv_api_skip_test = False
-    try:
-        resp = get_session().head(IPTV_API_SOURCE_URL, timeout=10, allow_redirects=True)
-        last_modified = resp.headers.get("Last-Modified")
-        if last_modified:
-            from email.utils import parsedate_to_datetime
-            lm_dt = parsedate_to_datetime(last_modified)
-            age_hours = (datetime.now(lm_dt.tzinfo) - lm_dt).total_seconds() / 3600
-            if age_hours <= IPTV_API_SKIP_TEST_TTL_HOURS:
-                iptv_api_skip_test = True
-                live_print(f"✅ iptv-api 数据新鲜（{age_hours:.1f}h 前），其来源将跳过测速")
-            else:
-                live_print(f"⚠️ iptv-api 数据已过期（{age_hours:.1f}h > {IPTV_API_SKIP_TEST_TTL_HOURS}h TTL），降级为正常测速")
-        else:
-            live_print("⚠️ iptv-api 无 Last-Modified 头，降级为正常测速")
-    except Exception as e:
-        live_print(f"⚠️ iptv-api 新鲜度检查失败: {e}，降级为正常测速")
-
     seen_urls = set()
     live_print("::group::📥 开始抓取直播源")
     for source_url in sources:
-        skip_this_source = (source_url == IPTV_API_SOURCE_URL and iptv_api_skip_test)
+        skip_this_source = False
         try:
             r = retry_request()(lambda u: get_session().get(u, timeout=10))(source_url)  # P0-3: 使用 Session + UA
             r.encoding = 'utf-8'
@@ -475,7 +453,7 @@ def fetch_and_parse_channels(aliases_exact, aliases_regex, known_main_names):
                     if parts[1].strip() not in seen_urls:
                         channels.append((main_name, parts[1].strip(), source_url))
                         seen_urls.add(parts[1].strip()); count += 1
-            label = "🔄免测" if skip_this_source else "🔍待测"
+            label = "🔍待测"
             live_print(f"✅ {source_url} -> 提取 {count} 条 [{label}]")
         except Exception as e:  # P0-1: 精确捕获异常并输出详情
             live_print(f"❌ 连接失败: {source_url} — {type(e).__name__}: {e}")
@@ -500,7 +478,7 @@ def fetch_and_parse_channels(aliases_exact, aliases_regex, known_main_names):
 # 5. 并发测速
 # ===============================
 def check_channel(main_name, url):
-    """并发测速：下载 128KB 判定存活，总超时保护确保不会卡死"""
+    """并发测速：下载 1MB 验证 + 带宽测量 + TS格式校验"""
     start_time = time.time()
     try:
         with get_session().get(url, stream=True, timeout=(CHECK_CONNECT_TIMEOUT, CHECK_READ_TIMEOUT)) as r:
@@ -509,23 +487,52 @@ def check_channel(main_name, url):
 
             downloaded = 0
             last_chunk_time = time.time()
+            ts_check_data = bytearray()  # 收集用于TS同步字节校验
 
             for chunk in r.iter_content(chunk_size=1024 * 64):
                 now = time.time()
-                # P1-7: 总超时保护 — 无论 chunk 间隔多短，总耗时超限直接终止
+                # 总超时保护
                 if now - start_time > CHECK_TOTAL_TIMEOUT:
-                    return False, main_name, url, round(now - start_time, 2), "总超时"
-                # 单 chunk 间隔超时（防止服务器极慢 drip 数据）
+                    bw = downloaded * 8 / (now - start_time) / 1_000_000 if now > start_time else 0
+                    return False, main_name, url, round(now - start_time, 2), f"总超时({bw:.1f}Mbps)"
+                # 单 chunk 间隔超时
                 if now - last_chunk_time > CHECK_READ_TIMEOUT:
-                    return False, main_name, url, round(now - start_time, 2), "读取超时"
+                    bw = downloaded * 8 / (now - start_time) / 1_000_000 if now > start_time else 0
+                    return False, main_name, url, round(now - start_time, 2), f"读取超时({bw:.1f}Mbps)"
+
+                # 收集前 512KB 用于格式校验
+                if len(ts_check_data) < 512 * 1024:
+                    ts_check_data.extend(chunk)
 
                 downloaded += len(chunk)
                 last_chunk_time = now
-                if downloaded >= CHECK_DOWNLOAD_TARGET:
-                    return True, main_name, url, round(now - start_time, 2), "成功"
 
-            # 流结束但不足128KB
-            return False, main_name, url, round(time.time() - start_time, 2), "流数据不足"
+                if downloaded >= CHECK_DOWNLOAD_TARGET:
+                    elapsed = time.time() - start_time
+                    bandwidth = downloaded * 8 / elapsed / 1_000_000
+
+                    # 带宽阈值过滤
+                    if bandwidth < CHECK_MIN_BANDWIDTH_MBPS:
+                        return False, main_name, url, round(elapsed, 2), f"带宽不足({bandwidth:.1f}Mbps < {CHECK_MIN_BANDWIDTH_MBPS})"
+
+                    # MPEG-TS 同步字节(0x47)校验
+                    ts_sample = memoryview(ts_check_data)[:512 * 1024]
+                    ts_score = 0.0
+                    if len(ts_sample) >= 188:
+                        expected = len(ts_sample) // 188
+                        syncs = sum(1 for i in range(0, expected * 188, 188) if ts_sample[i] == 0x47)
+                        ts_score = syncs / expected if expected > 0 else 0
+
+                    if ts_score >= 0.8:
+                        return True, main_name, url, round(elapsed, 2), f"TS流({bandwidth:.1f}Mbps)"
+                    else:
+                        # 非TS（HLS/FLV等），走带宽判断
+                        return True, main_name, url, round(elapsed, 2), f"非TS({bandwidth:.1f}Mbps)"
+
+            # 流结束但不足下载目标
+            elapsed = time.time() - start_time
+            bw = downloaded * 8 / elapsed / 1_000_000 if elapsed > 0 else 0
+            return False, main_name, url, round(elapsed, 2), f"流数据不足({bw:.1f}Mbps)"
 
     except requests.exceptions.Timeout:
         return False, main_name, url, round(time.time() - start_time, 2), "连接超时"
@@ -798,17 +805,16 @@ def auto_update_demo(valid_names, cat_order, chan_to_cat, chans_in_cat):
 # ===============================
 
 def apply_filter_lists(channels, blacklist_names, blacklist_urls, whitelist_names, whitelist_urls):
-    """黑白名单 + 来源免测分流过滤
+    """黑白名单过滤分流
     
     channels: [(name, url, source_url), ...]
-    - iptv-api 来源且数据新鲜 → 免测直入 valid_results（elapsed=-1）
     - 白名单 → 免测直入
     - 黑名单 → 拦截
     - 其余 → 进入 to_test 测速
     """
     to_test = []
     valid_results = {}
-    logs_blacklist, logs_whitelist, logs_skip_test = [], [], []
+    logs_blacklist, logs_whitelist = [], []
 
     for name, url, source_url in channels:
         if name in blacklist_names or url in blacklist_urls:
@@ -819,15 +825,10 @@ def apply_filter_lists(channels, blacklist_names, blacklist_urls, whitelist_name
             valid_results[name].append((url, -1.0))
             logs_whitelist.append(f"⚪ [白名单免测] {name:<12} | 免测 | {url}")
             continue
-        # iptv-api 来源免测（数据已由 iptv-api 验证过分辨率+速率）
-        if source_url == IPTV_API_SOURCE_URL:
-            if name not in valid_results: valid_results[name] = []
-            valid_results[name].append((url, -1.0))
-            logs_skip_test.append(f"🔄 [iptv-api免测] {name:<12} | 免测 | {url}")
-            continue
+    # (iptv-api 来源免测已取消，所有来源均走测速)
         to_test.append((name, url))
 
-    return to_test, valid_results, logs_blacklist, logs_whitelist, logs_skip_test
+    return to_test, valid_results, logs_blacklist, logs_whitelist
 
 
 def run_speed_test(to_test):
@@ -857,7 +858,7 @@ def run_speed_test(to_test):
     return valid_results, logs_success, logs_fail
 
 
-def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_skip_test, logs_blacklist):
+def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_blacklist):
     """写入 M3U/TXT 成品 + 日志文件"""
     live_print("::group::💾 写入结果文件")
 
@@ -874,7 +875,7 @@ def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_succe
                         ftxt.write(f"\n{cat}\n")
                         cat_written_in_txt = True
 
-                    # elapsed=-1 排最前（白名单+iptv-api免测），其余按速度升序
+                    # elapsed 排最前（白名单免测），其余按速度升序
                     valid_urls = sorted(valid_results[name], key=lambda x: (0 if x[1] < 0 else 1, x[1]))
                     for url, elapsed in valid_urls:
                         logo = get_local_logo_url(name)
@@ -889,7 +890,7 @@ def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_succe
 
     with open(LOG_FILE, "w", encoding="utf-8") as f:
         f.write(f"任务时间: {datetime.now()}\n")
-        f.write(f"白名单免测: {len(logs_whitelist)} | iptv-api免测: {len(logs_skip_test)} | 黑名单拦截: {len(logs_blacklist)}\n")
+        f.write(f"白名单免测: {len(logs_whitelist)} | 黑名单拦截: {len(logs_blacklist)}\n")
         f.write(f"常规测速有效: {len(logs_success)} | 常规测速失效: {len(logs_fail)}\n\n")
 
         if epg_report:
@@ -898,8 +899,7 @@ def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_succe
         if logs_whitelist:
             f.write("✅ 白名单免测:\n" + "\n".join(logs_whitelist) + "\n\n")
 
-        if logs_skip_test:
-            f.write("🔄 iptv-api免测:\n" + "\n".join(logs_skip_test) + "\n\n")
+        # iptv-api免测日志块已移除
 
         if logs_blacklist:
             f.write("❌ 黑名单拦截:\n" + "\n".join(logs_blacklist) + "\n\n")
@@ -932,12 +932,11 @@ if __name__ == "__main__":
         live_print("⚠️ 未获取到任何有效直播源，退出。")
         exit(0)
 
-    # 黑白名单 + 来源免测分流
-    to_test, valid_results, logs_blacklist, logs_whitelist, logs_skip_test = apply_filter_lists(
+    # 黑白名单过滤分流
+    to_test, valid_results, logs_blacklist, logs_whitelist = apply_filter_lists(
         channels, blacklist_names, blacklist_urls, whitelist_names, whitelist_urls
     )
-    skip_total = len(logs_whitelist) + len(logs_skip_test)
-    live_print(f"\n🚀 开始测速 (待测: {len(to_test)} 条, 免测: 白名单{len(logs_whitelist)}+iptv-api{len(logs_skip_test)}={skip_total} 条, 拦截: {len(logs_blacklist)} 条)...\n")
+    live_print(f"\n🚀 开始测速 (待测: {len(to_test)} 条, 免测: 白名单{len(logs_whitelist)} 条, 拦截: {len(logs_blacklist)} 条)...\n")
 
     # 并发测速
     test_results, logs_success, logs_fail = run_speed_test(to_test)
@@ -963,4 +962,4 @@ if __name__ == "__main__":
         cat_order = non_empty_cats
 
     # 写入成品
-    write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_skip_test, logs_blacklist)
+    write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_blacklist)
