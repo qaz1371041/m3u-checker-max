@@ -1,7 +1,7 @@
-import os, time, concurrent.futures, requests, gzip, io, re, random
+import os, time, concurrent.futures, requests, gzip, io, re, random, json
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 # ===============================
 # 1. 核心配置区
@@ -486,7 +486,6 @@ def fetch_source_meta():
     try:
         r = get_session().get(SOURCE_META_URL, timeout=10)
         if r.status_code == 200:
-            import json
             meta = json.loads(r.text)
             # host_port 统一为 lowercase（URL 解析可能大小写敏感）
             meta = {k.lower(): v for k, v in meta.items()}
@@ -845,11 +844,22 @@ def apply_filter_lists(channels, blacklist_names, blacklist_urls, whitelist_name
             logs_blacklist.append(f"⚫ [黑名单屏蔽] {name:<12} | {url}")
             continue
         if name in whitelist_names or url in whitelist_urls:
+            # 白名单快速存活检测（HEAD 请求，轻量发现死链）
+            try:
+                hr = get_session().head(url, timeout=3)
+                if hr.status_code != 200:
+                    # 白名单已死，降级到测速队列
+                    logs_whitelist.append(f"⚪→🔍 [白名单失效] {name:<12} | 降级测速 | {url}")
+                    to_test.append((name, url))
+                    continue
+            except requests.RequestException:
+                logs_whitelist.append(f"⚪→🔍 [白名单离线] {name:<12} | 降级测速 | {url}")
+                to_test.append((name, url))
+                continue
             if name not in valid_results: valid_results[name] = []
             valid_results[name].append((url, -1.0))
             logs_whitelist.append(f"⚪ [白名单免测] {name:<12} | 免测 | {url}")
             continue
-    # (iptv-api 来源免测已取消，所有来源均走测速)
         to_test.append((name, url))
 
     return to_test, valid_results, logs_blacklist, logs_whitelist
@@ -993,6 +1003,7 @@ def run_speed_test(to_test, source_meta=None):
                     logs_fail.append(msg)
 
     live_print(f"\n🏁 测速结束: 成功 {len(logs_success)} / 失败 {len(logs_fail)}\n")
+    return valid_results, logs_success, logs_fail
 
 
 def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_blacklist):
