@@ -831,7 +831,7 @@ def apply_filter_lists(channels, blacklist_names, blacklist_urls, whitelist_name
     """黑白名单过滤分流
     
     channels: [(name, url, source_url), ...]
-    - 白名单 → 免测直入
+    - 白名单 → 并发 HEAD 存活检测，在线免测，离线降级
     - 黑名单 → 拦截
     - 其余 → 进入 to_test 测速
     """
@@ -839,28 +839,42 @@ def apply_filter_lists(channels, blacklist_names, blacklist_urls, whitelist_name
     valid_results = {}
     logs_blacklist, logs_whitelist = [], []
 
+    # 第一趟：分离白名单条目，并发做存活检测
+    whitelist_candidates = []  # [(name, url), ...]
     for name, url, source_url in channels:
         if name in blacklist_names or url in blacklist_urls:
             logs_blacklist.append(f"⚫ [黑名单屏蔽] {name:<12} | {url}")
-            continue
-        if name in whitelist_names or url in whitelist_urls:
-            # 白名单快速存活检测（HEAD 请求，轻量发现死链）
+        elif name in whitelist_names or url in whitelist_urls:
+            whitelist_candidates.append((name, url))
+        else:
+            to_test.append((name, url))
+
+    if whitelist_candidates:
+        whitelist_alive = set()  # 存储 (name, url) of alive entries
+        dead_entries = []
+
+        def _check_head(name, url):
             try:
                 hr = get_session().head(url, timeout=3)
-                if hr.status_code != 200:
-                    # 白名单已死，降级到测速队列
-                    logs_whitelist.append(f"⚪→🔍 [白名单失效] {name:<12} | 降级测速 | {url}")
-                    to_test.append((name, url))
-                    continue
+                if hr.status_code == 200:
+                    return (name, url, True)
             except requests.RequestException:
-                logs_whitelist.append(f"⚪→🔍 [白名单离线] {name:<12} | 降级测速 | {url}")
-                to_test.append((name, url))
-                continue
-            if name not in valid_results: valid_results[name] = []
-            valid_results[name].append((url, -1.0))
-            logs_whitelist.append(f"⚪ [白名单免测] {name:<12} | 免测 | {url}")
-            continue
-        to_test.append((name, url))
+                pass
+            return (name, url, False)
+
+        live_print(f"🔍 白名单存活检测: {len(whitelist_candidates)} 条 (并发 HEAD)")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+            futs = {ex.submit(_check_head, n, u): (n, u) for n, u in whitelist_candidates}
+            for f in concurrent.futures.as_completed(futs):
+                name, url, alive = f.result()
+                if alive:
+                    whitelist_alive.add((name, url))
+                    if name not in valid_results: valid_results[name] = []
+                    valid_results[name].append((url, -1.0))
+                    logs_whitelist.append(f"⚪ [白名单免测] {name:<12} | 免测 | {url}")
+                else:
+                    to_test.append((name, url))
+                    logs_whitelist.append(f"⚪→🔍 [白名单离线] {name:<12} | 降级测速 | {url}")
 
     return to_test, valid_results, logs_blacklist, logs_whitelist
 
