@@ -1,6 +1,7 @@
-import os, time, concurrent.futures, requests, gzip, io, re
+import os, time, concurrent.futures, requests, gzip, io, re, random
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from urllib.parse import urlparse
 
 # ===============================
 # 1. 核心配置区
@@ -27,6 +28,9 @@ REPO_RAW = f"{CDN_BASE}/https://raw.githubusercontent.com/JE668/m3u-checker-max/
 # M3U 头部
 M3U_HEADER = f'#EXTM3U x-tvg-url="{REPO_RAW}/output/epg.xml.gz"\n'
 
+# get-m3u 探针元数据（用于测速优先级排序）
+SOURCE_META_URL = f"{CDN_BASE}/https://raw.githubusercontent.com/JE668/get-m3u/refs/heads/main/output/source-meta.json"
+
 # EPG 垃圾词汇过滤库
 EPG_BLACKLIST = [
     "未能提供", "暂无节目", "精彩节目", "精彩節目",
@@ -39,6 +43,9 @@ DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
 
 # 测速并发线程数
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "50"))
+
+# 服务器级预筛：每台服务器先抽检多少个频道判断死活
+SAMPLE_PER_HOST = int(os.environ.get("SAMPLE_PER_HOST", "2"))
 
 # 测速参数
 CHECK_CONNECT_TIMEOUT = int(os.environ.get("CHECK_CONNECT_TIMEOUT", "5"))
@@ -474,6 +481,23 @@ def fetch_and_parse_channels(aliases_exact, aliases_regex, known_main_names):
     live_print("::endgroup::")
     return channels
 
+def fetch_source_meta():
+    """获取 get-m3u 探针元数据，返回 {host_port: {bandwidth_mbps: float}}"""
+    try:
+        r = get_session().get(SOURCE_META_URL, timeout=10)
+        if r.status_code == 200:
+            import json
+            meta = json.loads(r.text)
+            # host_port 统一为 lowercase（URL 解析可能大小写敏感）
+            meta = {k.lower(): v for k, v in meta.items()}
+            live_print(f"📡 已加载探针元数据: {len(meta)} 台服务器")
+            return meta
+    except requests.RequestException as e:
+        live_print(f"⚠️ 探针元数据不可用: {e}")
+    except (ValueError, json.JSONDecodeError) as e:
+        live_print(f"⚠️ 探针元数据解析失败: {e}")
+    return None
+
 # ===============================
 # 5. 并发测速
 # ===============================
@@ -831,31 +855,144 @@ def apply_filter_lists(channels, blacklist_names, blacklist_urls, whitelist_name
     return to_test, valid_results, logs_blacklist, logs_whitelist
 
 
-def run_speed_test(to_test):
-    """并发测速：返回 (valid_results, logs_success, logs_fail)"""
+def run_speed_test(to_test, source_meta=None):
+    """并发测速：服务器级预筛 + 全量测速
+    
+    改进点：
+    1. 按 host (ip:port) 分组
+    2. 每组先抽 SAMPLE_PER_HOST 个频道预检
+    3. 预检全部失败 → 标记服务器死亡，跳过该组其余频道
+    4. 预检至少通过一个 → 全量测试该组其余频道
+    5. 若提供 source_meta，低带宽服务器减少预检样本，全量按带宽降序优先
+    """
     valid_results = {}
     logs_success, logs_fail = [], []
-    total = len(to_test)
+
+    if not to_test:
+        return valid_results, logs_success, logs_fail
+
+    # Phase 1: 按 host 分组
+    host_groups = {}
+    for name, url in to_test:
+        parsed = urlparse(url)
+        host = parsed.hostport or parsed.hostname
+        host_groups.setdefault(host.lower(), []).append((name, url))
+
+    live_print(f"\n📊 测速分组: {len(host_groups)} 台服务器, {len(to_test)} 个频道")
+
+    # Phase 2: 自适应样本数 — 从 meta 读取带宽，低带宽机器少抽
+    # 优先级规则：带宽越高越优先全量测
+    host_priority = {}  # host -> sort_key (数字越大越优先)
+    for host in host_groups:
+        bw = (source_meta or {}).get(host, {}).get("bandwidth_mbps", 0) or 0
+        if bw >= 5.0:
+            samples = SAMPLE_PER_HOST
+            priority = 4
+        elif bw >= 2.0:
+            samples = SAMPLE_PER_HOST
+            priority = 3
+        elif bw >= 1.0:
+            samples = max(1, SAMPLE_PER_HOST - 1)  # 减一半样本
+            priority = 2
+        elif bw >= 0.5:
+            samples = 1  # 只测 1 个
+            priority = 1
+        else:
+            samples = 1  # 无 meta 或极低带宽，也测 1 个碰运气
+            priority = 0
+        host_priority[host] = (priority, bw, host)
+        if source_meta and bw > 0:
+            live_print(f"  ⚡ {host:<21} | {bw:>5.1f}Mbps | 样本数: {samples}")
+
+    sample_tasks = []            # (name, url, host)
+    remaining_by_host = {}       # host -> [(name, url), ...]
+    small_host_tasks = []        # (name, url, host) — 不足样本数的直接全量
+
+    for host, entries in host_groups.items():
+        bl, bw, _ = host_priority[host]
+        sample_count = min(max(1, SAMPLE_PER_HOST if bl >= 2 else (1 if bw >= 0.5 else 1)), len(entries))
+        entries_list = list(entries)
+        if len(entries_list) <= sample_count:
+            small_host_tasks.extend((n, u, host) for n, u in entries_list)
+        else:
+            sampled = random.sample(entries_list, sample_count)
+            sampled_set = set(sampled)
+            remaining = [e for e in entries_list if e not in sampled_set]
+            sample_tasks.extend((n, u, host) for n, u in sampled)
+            remaining_by_host[host] = remaining
+
+    total_samples = len(sample_tasks) + len(small_host_tasks)
+    sample_results = {}  # host -> [True/False, ...]
     processed = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(check_channel, name, url) for name, url in to_test]
-        for future in concurrent.futures.as_completed(futures):
-            processed += 1
-            is_valid, name, url, elapsed, reason = future.result()
-            progress = f"[{processed}/{total}]"
-            if is_valid:
-                if name not in valid_results: valid_results[name] = []
-                valid_results[name].append((url, elapsed))
-                msg = f"{progress} 🟢 {name:<12} | {elapsed:>4}s | {reason:<15} | {url}"
-                live_print(msg)
-                logs_success.append(msg)
-            else:
-                msg = f"{progress} 🔴 {name:<12} | {reason:<15} | {url}"
-                logs_fail.append(msg)
+    # 合并样本任务一起并发测
+    all_samples = sample_tasks + small_host_tasks
+
+    def _process_result(name, url, host, is_valid, elapsed, reason):
+        nonlocal processed
+        processed += 1
+        sample_results.setdefault(host, []).append(is_valid)
+        if is_valid:
+            valid_results.setdefault(name, []).append((url, elapsed))
+            msg = f"🎯 [{processed}/{total_samples}] 🟢 {name:<12} | {elapsed:>4}s | {reason:<15} | {url}"
+            live_print(msg)
+            logs_success.append(msg)
+        else:
+            msg = f"🎯 [{processed}/{total_samples}] 🔴 {name:<12} | {reason:<15} | {url}"
+            logs_fail.append(msg)
+
+    if all_samples:
+        live_print(f"🎯 预筛阶段: {len(all_samples)} 个样本")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(check_channel, name, url): (name, url, host)
+                       for name, url, host in all_samples}
+            for future in concurrent.futures.as_completed(futures):
+                name, url, host = futures[future]
+                is_valid, _, _, elapsed, reason = future.result()
+                _process_result(name, url, host, is_valid, elapsed, reason)
+
+    # 判断服务器死活
+    alive_hosts = set(h for h, rs in sample_results.items() if any(rs))
+    dead_hosts = set(remaining_by_host.keys()) - alive_hosts
+
+    if dead_hosts:
+        skipped = sum(len(remaining_by_host[h]) for h in dead_hosts)
+        live_print(f"\n💀 淘汰 {len(dead_hosts)} 台死服务器, 跳过 {skipped} 个频道")
+        for host in dead_hosts:
+            for name, url in remaining_by_host[host]:
+                logs_fail.append(f"⏭️ [服务器死亡] {name:<12} | {url}")
+
+    # Phase 3: 全量测速存活服务器的剩余频道，按 meta 带宽降序排序
+    full_test = []
+    alive_host_list = sorted(alive_hosts, key=lambda h: host_priority.get(h, (0, 0, h))[0], reverse=True)
+    for host in alive_host_list:
+        if host in remaining_by_host:
+            # 同 host 内按频道名排序保持一致
+            entries = sorted(remaining_by_host[host])
+            full_test.extend([(n, u) for n, u in entries])
+
+    if full_test:
+        total = len(full_test)
+        processed = 0
+        live_print(f"🚀 全量测速: {total} 个频道 ({len(alive_hosts)} 台服务器, 优先高带宽)")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(check_channel, name, url): (name, url)
+                       for name, url in full_test}
+            for future in concurrent.futures.as_completed(futures):
+                processed += 1
+                name, url = futures[future]
+                is_valid, _, _, elapsed, reason = future.result()
+                if is_valid:
+                    valid_results.setdefault(name, []).append((url, elapsed))
+                    msg = f"[{processed}/{total}] 🟢 {name:<12} | {elapsed:>4}s | {reason:<15} | {url}"
+                    live_print(msg)
+                    logs_success.append(msg)
+                else:
+                    msg = f"[{processed}/{total}] 🔴 {name:<12} | {reason:<15} | {url}"
+                    logs_fail.append(msg)
 
     live_print(f"\n🏁 测速结束: 成功 {len(logs_success)} / 失败 {len(logs_fail)}\n")
-    return valid_results, logs_success, logs_fail
 
 
 def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_blacklist):
@@ -938,8 +1075,9 @@ if __name__ == "__main__":
     )
     live_print(f"\n🚀 开始测速 (待测: {len(to_test)} 条, 免测: 白名单{len(logs_whitelist)} 条, 拦截: {len(logs_blacklist)} 条)...\n")
 
-    # 并发测速
-    test_results, logs_success, logs_fail = run_speed_test(to_test)
+    # 并发测速（传入 source_meta 做优先级排序）
+    source_meta = fetch_source_meta()
+    test_results, logs_success, logs_fail = run_speed_test(to_test, source_meta=source_meta)
     # 合并免测与测速结果（同名频道 URL 合并去重）
     for name, url_list in test_results.items():
         if name not in valid_results:
