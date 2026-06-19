@@ -900,8 +900,11 @@ def run_speed_test(to_test, source_meta=None):
     for name, url in to_test:
         parsed = urlparse(url)
         host = parsed.hostname
+        # IPv6 加回方括号（无论是否有端口，确保 key 一致）
+        if ':' in parsed.hostname:
+            host = f"[{parsed.hostname}]"
         if parsed.port:
-            host = f"{parsed.hostname}:{parsed.port}"
+            host = f"{host}:{parsed.port}"
         host_groups.setdefault(host.lower(), []).append((name, url))
 
     live_print(f"\n📊 测速分组: {len(host_groups)} 台服务器, {len(to_test)} 个频道")
@@ -1100,6 +1103,12 @@ if __name__ == "__main__":
     to_test, valid_results, logs_blacklist, logs_whitelist = apply_filter_lists(
         channels, blacklist_names, blacklist_urls, whitelist_names, whitelist_urls
     )
+
+    # 过滤 IPv6 地址（GitHub Actions 无 IPv6 路由到国内运营商）
+    ipv6_count = sum(1 for _, url in to_test if '[' in url)
+    if ipv6_count:
+        to_test = [(n, u) for n, u in to_test if '[' not in u]
+        live_print(f"🔇 过滤 {ipv6_count} 条 IPv6 链接 (GitHub Actions 无 IPv6 路由)")
     live_print(f"\n🚀 开始测速 (待测: {len(to_test)} 条, 免测: 白名单{len(logs_whitelist)} 条, 拦截: {len(logs_blacklist)} 条)...\n")
 
     # 并发测速（传入 source_meta 做优先级排序）
