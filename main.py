@@ -908,8 +908,11 @@ def _classify_failure(reason):
     return "其他"
 
 
-def run_speed_test(to_test, source_meta=None):
+def run_speed_test(to_test, source_meta=None, source_urls=None):
     """并发测速：服务器级预筛 + 全量测速
+    
+    source_urls: {url: source_url} — 来源统计用
+    返回: (valid_results, logs_success, logs_fail, fail_counts, source_stats)
     
     改进点：
     1. 按 host (ip:port) 分组
@@ -921,9 +924,10 @@ def run_speed_test(to_test, source_meta=None):
     valid_results = {}
     logs_success, logs_fail = [], []
     fail_counts = {}  # 失败原因分类统计
+    source_ok, source_total = {}, {}  # 来源统计
 
     if not to_test:
-        return valid_results, logs_success, logs_fail
+        return valid_results, logs_success, logs_fail, fail_counts, {}
 
     # Phase 1: 按 host 分组
     host_groups = {}
@@ -994,7 +998,14 @@ def run_speed_test(to_test, source_meta=None):
         if not is_valid:
             cat = _classify_failure(reason)
             fail_counts[cat] = fail_counts.get(cat, 0) + 1
+            if source_urls:
+                src = source_urls.get(url, "未知")
+                source_total[src] = source_total.get(src, 0) + 1
         if is_valid:
+            if source_urls:
+                src = source_urls.get(url, "未知")
+                source_ok[src] = source_ok.get(src, 0) + 1
+                source_total[src] = source_total.get(src, 0) + 1
             valid_results.setdefault(name, []).append((url, elapsed))
             msg = f"🎯 [{processed}/{total_samples}] 🟢 {name:<12} | {elapsed:>4}s | {reason:<15} | {url}"
             live_print(msg)
@@ -1046,6 +1057,10 @@ def run_speed_test(to_test, source_meta=None):
                 name, url = futures[future]
                 is_valid, _, _, elapsed, reason = future.result()
                 if is_valid:
+                    if source_urls:
+                        src = source_urls.get(url, "未知")
+                        source_ok[src] = source_ok.get(src, 0) + 1
+                        source_total[src] = source_total.get(src, 0) + 1
                     valid_results.setdefault(name, []).append((url, elapsed))
                     msg = f"[{processed}/{total}] 🟢 {name:<12} | {elapsed:>4}s | {reason:<15} | {url}"
                     live_print(msg)
@@ -1053,6 +1068,9 @@ def run_speed_test(to_test, source_meta=None):
                 else:
                     cat = _classify_failure(reason)
                     fail_counts[cat] = fail_counts.get(cat, 0) + 1
+                    if source_urls:
+                        src = source_urls.get(url, "未知")
+                        source_total[src] = source_total.get(src, 0) + 1
                     msg = f"[{processed}/{total}] 🔴 {name:<12} | {reason:<15} | {url}"
                     logs_fail.append(msg)
 
@@ -1068,11 +1086,28 @@ def run_speed_test(to_test, source_meta=None):
             bar = '█' * min(count // 5 + 1, 15)
             live_print(f"  {cat:<12} {count:>5}  {bar}")
         live_print()
-    return valid_results, logs_success, logs_fail
+
+    # 来源统计
+    if source_total:
+        live_print("📊 各来源测速结果:")
+        live_print(f"  {'来源':<30} {'成功':>5} {'总计':>5} {'成功率':>8}")
+        live_print(f"  {'─'*52}")
+        for src in sorted(source_total, key=lambda s: source_total[s], reverse=True):
+            ok = source_ok.get(src, 0)
+            total = source_total[src]
+            rate = f"{ok/total*100:.0f}%" if total > 0 else "-"
+            bar = '█' * max(1, min(ok * 15 // max(total, 1), 15))
+            dim = '░' * (15 - len(bar))
+            live_print(f"  {src[-30:]:>30} {ok:>5} {total:>5} {rate:>8}  {bar}{dim}")
+        live_print()
+
+    return valid_results, logs_success, logs_fail, fail_counts, {"ok": source_ok, "total": source_total}
 
 
-def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_blacklist):
+def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_blacklist, extra_stats=None):
     """写入 M3U/TXT 成品 + 日志文件"""
+    if extra_stats is None:
+        extra_stats = {}
     live_print("::group::💾 写入结果文件")
 
     # 外部 fallback logo 基础 URL
@@ -1120,6 +1155,48 @@ def write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_succe
         f.write("🟢 测速有效源:\n" + "\n".join(logs_success) + "\n\n")
         f.write("🔴 测速失效源:\n" + "\n".join(logs_fail))
 
+    # 附加数据：写入 log.txt 额外统计
+    if extra_stats:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 42 + "\n")
+            f.write("📊 补充统计\n" + "=" * 42 + "\n\n")
+
+            # 来源统计
+            source_ok = extra_stats.get("source_ok", {})
+            source_total = extra_stats.get("source_total", {})
+            if source_total:
+                f.write("各来源测速结果:\n")
+                f.write(f"  {'来源':<50} {'成功':>6} {'总计':>6} {'成功率':>8}\n")
+                f.write(f"  {'─'*74}\n")
+                for src in sorted(source_total, key=lambda s: source_total[s], reverse=True):
+                    ok = source_ok.get(src, 0)
+                    total = source_total[src]
+                    rate = f"{ok/total*100:.1f}%" if total > 0 else "-"
+                    label = src.split("/")[-1][:48]  # 取文件名
+                    f.write(f"  {label:<50} {ok:>6} {total:>6} {rate:>8}\n")
+                f.write("\n")
+
+            # 失败分类
+            fail_counts = extra_stats.get("fail_counts", {})
+            if fail_counts:
+                f.write("失败原因统计:\n")
+                for cat in sorted(fail_counts, key=fail_counts.get, reverse=True):
+                    f.write(f"  {cat:<12} {fail_counts[cat]}\n")
+                f.write("\n")
+
+            # 频道分类落点统计
+            valid_count = extra_stats.get("cat_live_counts", {})
+            if valid_count:
+                f.write("分类频道存活情况:\n")
+                for cat in sorted(valid_count, key=valid_count.get, reverse=True):
+                    f.write(f"  {cat:<40} {valid_count[cat]} 个频道\n")
+                f.write("\n")
+
+            # 运行时间
+            elapsed = extra_stats.get("elapsed_seconds", 0)
+            if elapsed:
+                f.write(f"总运行时长: {elapsed:.0f} 秒 ({elapsed/60:.1f} 分钟)\n")
+
     live_print(f"✅ 所有结果文件已生成至 output/ 目录")
     live_print("::endgroup::")
 
@@ -1145,6 +1222,18 @@ if __name__ == "__main__":
         live_print("⚠️ 未获取到任何有效直播源，退出。")
         exit(0)
 
+    # 建立 URL → 来源 映射
+    start_time = time.time()
+    url_to_source = {}
+    for _, url, source_url in channels:
+        url_to_source[url] = source_url
+
+    source_channel_counts = {}
+    for _, _, src in channels:
+        source_channel_counts[src] = source_channel_counts.get(src, 0) + 1
+    for src, cnt in source_channel_counts.items():
+        live_print(f"  📡 {src.split('/')[-1]}: {cnt} 条")
+
     # 黑白名单过滤分流
     to_test, valid_results, logs_blacklist, logs_whitelist = apply_filter_lists(
         channels, blacklist_names, blacklist_urls, whitelist_names, whitelist_urls
@@ -1157,9 +1246,11 @@ if __name__ == "__main__":
         live_print(f"🔇 过滤 {ipv6_count} 条 IPv6 链接 (GitHub Actions 无 IPv6 路由)")
     live_print(f"\n🚀 开始测速 (待测: {len(to_test)} 条, 免测: 白名单{len(logs_whitelist)} 条, 拦截: {len(logs_blacklist)} 条)...\n")
 
-    # 并发测速（传入 source_meta 做优先级排序）
+    # 并发测速（传入 source_meta 做优先级排序 + source_urls 做来源统计）
     source_meta = fetch_source_meta()
-    test_results, logs_success, logs_fail = run_speed_test(to_test, source_meta=source_meta)
+    test_results, logs_success, logs_fail, fail_counts, source_stats = run_speed_test(
+        to_test, source_meta=source_meta, source_urls=url_to_source
+    )
     # 合并免测与测速结果（同名频道 URL 合并去重）
     for name, url_list in test_results.items():
         if name not in valid_results:
@@ -1182,4 +1273,15 @@ if __name__ == "__main__":
         cat_order = non_empty_cats
 
     # 写入成品
-    write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_blacklist)
+    cat_live_counts = {}
+    for cat in cat_order:
+        cat_live_counts[cat] = sum(1 for name in chans_in_cat.get(cat, []) if name in valid_results)
+
+    extra_stats = {
+        "source_ok": source_stats["ok"],
+        "source_total": source_stats["total"],
+        "fail_counts": fail_counts,
+        "cat_live_counts": cat_live_counts,
+        "elapsed_seconds": time.time() - start_time,
+    }
+    write_outputs(valid_results, cat_order, chans_in_cat, epg_report, logs_success, logs_fail, logs_whitelist, logs_blacklist, extra_stats)
