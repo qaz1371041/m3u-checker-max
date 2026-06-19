@@ -879,6 +879,35 @@ def apply_filter_lists(channels, blacklist_names, blacklist_urls, whitelist_name
     return to_test, valid_results, logs_blacklist, logs_whitelist
 
 
+def _classify_failure(reason):
+    """对失败原因分类"""
+    if reason.startswith("HTTP "):
+        code = reason.split()[1]
+        if code.startswith("4"):
+            return "HTTP 4xx"
+        elif code.startswith("5"):
+            return "HTTP 5xx"
+        else:
+            return f"HTTP {code}"
+    if reason.startswith("连接超时"):
+        return "连接超时"
+    if reason.startswith("连接失败"):
+        return "连接失败"
+    if reason.startswith("读取超时"):
+        return "读取超时"
+    if reason.startswith("总超时"):
+        return "总超时"
+    if reason.startswith("带宽不足"):
+        return "带宽不足"
+    if reason.startswith("流数据不足"):
+        return "流数据不足"
+    if reason.startswith("异常"):
+        return "其他异常"
+    if reason.startswith("⏭️") or "服务器死亡" in reason:
+        return "服务器死亡"
+    return "其他"
+
+
 def run_speed_test(to_test, source_meta=None):
     """并发测速：服务器级预筛 + 全量测速
     
@@ -891,6 +920,7 @@ def run_speed_test(to_test, source_meta=None):
     """
     valid_results = {}
     logs_success, logs_fail = [], []
+    fail_counts = {}  # 失败原因分类统计
 
     if not to_test:
         return valid_results, logs_success, logs_fail
@@ -961,6 +991,9 @@ def run_speed_test(to_test, source_meta=None):
         nonlocal processed
         processed += 1
         sample_results.setdefault(host, []).append(is_valid)
+        if not is_valid:
+            cat = _classify_failure(reason)
+            fail_counts[cat] = fail_counts.get(cat, 0) + 1
         if is_valid:
             valid_results.setdefault(name, []).append((url, elapsed))
             msg = f"🎯 [{processed}/{total_samples}] 🟢 {name:<12} | {elapsed:>4}s | {reason:<15} | {url}"
@@ -1018,10 +1051,23 @@ def run_speed_test(to_test, source_meta=None):
                     live_print(msg)
                     logs_success.append(msg)
                 else:
+                    cat = _classify_failure(reason)
+                    fail_counts[cat] = fail_counts.get(cat, 0) + 1
                     msg = f"[{processed}/{total}] 🔴 {name:<12} | {reason:<15} | {url}"
                     logs_fail.append(msg)
 
     live_print(f"\n🏁 测速结束: 成功 {len(logs_success)} / 失败 {len(logs_fail)}\n")
+
+    # 失败原因分类统计
+    if fail_counts:
+        live_print("📊 失败原因分布:")
+        live_print(f"  {'类别':<12} {'数量':>5}")
+        live_print(f"  {'─'*18}")
+        for cat in sorted(fail_counts, key=fail_counts.get, reverse=True):
+            count = fail_counts[cat]
+            bar = '█' * min(count // 5 + 1, 15)
+            live_print(f"  {cat:<12} {count:>5}  {bar}")
+        live_print()
     return valid_results, logs_success, logs_fail
 
 
